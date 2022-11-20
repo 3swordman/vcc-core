@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <ctime>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -31,22 +32,22 @@ using json = nlohmann::json;
 
 using namespace std::literals;
 
-#define unlikely
-
 #ifdef NDEBUG
 #define DEBUG_MODE 0
 #else
 #define DEBUG_MODE 1
 #endif
 
+#define CONCAT_IMPL(a,b) a##b
+#define CONCAT(a,b) CONCAT_IMPL(a,b)
+
 
 constexpr int vcc_port = 46;
 constexpr size_t buf_size = 1 << 10;
 
 int nfds_total = 1;
-int fd;
 int pollfds = 1024;
-int next_fd;
+
 pollfd *fds;
 
 struct user {
@@ -114,11 +115,13 @@ struct message {
     std::string username;
     std::string data;
     message_type type;
+    time_t time;
     std::string to_json() const {
         json json_obj {
             {"user", send_user->username},
             {"data", data},
-            {"type", type_enum_to_string(type)}
+            {"type", type_enum_to_string(type)},
+            {"time", time}
         };
         return json_obj.dump();
     }
@@ -141,6 +144,11 @@ struct connection {
     bool operator==(const connection &other) const {
         return fd == other.fd && connect_user == other.connect_user;
     }
+
+    void close() {
+        shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+    }
 };
 
 struct connection_list {
@@ -155,68 +163,64 @@ struct connection_list {
     }
 };
 
-
 std::optional<message> json_to_message(const std::string &content, user *connect_user) noexcept {
     // { "type": "message", "user": "username", "data": "message" }
     try {
         auto json_content = json::parse(content);
         const auto username = json_content["user"].get<std::string>();
         const auto data = json_content["data"].get<std::string>();
-        const auto type_string = json_content["type"].get<std::string>();
-        message_type type = type_string_to_enum(type_string);
+        const auto type = json_content["type"].get<std::string>();
 
-        message msg;
-        msg.send_user = connect_user ? connect_user : nullptr;
-        msg.username = username;
-        msg.data = std::move(data);
-        msg.type = type;
-
-        return msg;
+        return message {
+            .send_user = connect_user ? connect_user : nullptr,
+            .username = std::move(username),
+            .data = std::move(data),
+            .type = type_string_to_enum(type),
+            .time = time(NULL)
+        };
     } catch (const std::exception &exc) {
         std::cerr << exc.what() << "\n";
         return std::nullopt;
     }
 }
+
+#define regex_search_nullopt(name)               \
+    if (!std::regex_search(content, match_result, CONCAT(name,_regex))) {    \
+        return std::nullopt;                                        \
+    }                                                               \
+    std::string name = match_result[1]
 
 std::optional<message> lisp_list_to_message(const std::string &content, user *connect_user) noexcept {
     // (message (user 'username) (data "message"))
     // TODO: use a better way instead of regex to parse the lisp list
     try {
-        static std::regex username_regex{R"regex(\(user '.+?(?=\)))regex"};
-        static std::regex data_regex{R"regex(\(data ".*?(?="))regex"};
-        static std::regex type_regex{R"regex(\(.+?(?=(\(| )))regex"};
+        static std::regex username_regex{R"regex(\(user '(.+?(?=\))))regex"};
+        static std::regex data_regex{R"regex(\(data "(.*?(?=")))regex"};
+        static std::regex type_regex{R"regex(\((.+?(?=(\(| ))))regex"};
         std::smatch match_result;
 
-        if (!std::regex_search(content, match_result, username_regex)) {
-            return std::nullopt;
-        }
-        std::string username = match_result[0];
-        username = username.substr(7);
-
-        if (!std::regex_search(content, match_result, data_regex)) {
-            return std::nullopt;
-        }
-        std::string data = match_result[0];
-        data = data.substr(7);
+        regex_search_nullopt(username);
+        regex_search_nullopt(data);
+        regex_search_nullopt(type);
 
         if (!std::regex_search(content, match_result, type_regex)) {
             return std::nullopt;
         }
-        std::string type_string = match_result[0];
-        data = data.substr(1);
-        message_type type = type_string_to_enum(type_string);
 
-        message msg;
-        msg.send_user = connect_user ? connect_user : nullptr;
-        msg.username = username;
-        msg.data = std::move(data);
-        msg.type = type;
-        return msg;
+        return message {
+            .send_user = connect_user ? connect_user : nullptr,
+            .username = std::move(username),
+            .data = std::move(data),
+            .type = type_string_to_enum(type),
+            .time = time(NULL)
+        };
     } catch (const std::exception &exc) {
         std::cerr << exc.what() << "\n";
         return std::nullopt;
     }
 }
+
+#undef regex_search_nullopt
 
 void err_handler(const char *name, int i) {
     if (i < 0) {
@@ -235,7 +239,6 @@ struct socket_connection {
         int i, enable = 1;
 
         err_handler("socket()", (fd = socket(AF_INET, SOCK_STREAM, 0)));
-        ::fd = fd;
 
         std::memset(&addr, 0, sizeof(struct sockaddr_in));
 
@@ -262,12 +265,10 @@ struct socket_connection {
 
         fds[0].fd = fd;
         fds[0].events = POLLIN;
-
-        next_fd = 1;
         
     }
     void broadcast_message(connection &except_connection, const message &msg) {
-        auto data_sent = msg.to_lisp_list(); // or msg.to_json()
+        auto data_sent = msg.to_json(); // or msg.to_lisp_list()
         data_sent += "\n";
         for (auto &&i : connections.connections) {
             if (i == except_connection) continue;
@@ -288,8 +289,8 @@ struct socket_connection {
                 int usr_fd;
 
                 err_handler("accept()", (usr_fd = accept(fd, (struct sockaddr *) &usr_addr, &size)));
-                fds[next_fd].fd = usr_fd;
-                fds[next_fd].events = POLLIN;
+                fds[nfds_total].fd = usr_fd;
+                fds[nfds_total].events = POLLIN;
 
                 connections.connections.push_back(connection {
                     .fd = usr_fd,
@@ -297,7 +298,6 @@ struct socket_connection {
                 });
                 std::cout << "fd: " << usr_fd << std::endl;
 
-                next_fd++;
                 nfds_total++;
             }
             for (int i = 1; i < nfds_total; i++) {
@@ -329,6 +329,7 @@ struct socket_connection {
                     break;
                 }
             }
+            curr_connection.close();
             return std::nullopt;
         }
 
