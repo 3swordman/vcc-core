@@ -10,6 +10,7 @@
 #include <exception>
 #include <regex>
 #include <memory>
+#include <functional>
 
 #include <cstring>
 #include <cstdlib>
@@ -155,20 +156,17 @@ struct connection_list {
 };
 
 
-std::optional<message> json_to_message(const std::string &content, user_list &users) noexcept {
+std::optional<message> json_to_message(const std::string &content, user *connect_user) noexcept {
     // { "type": "message", "user": "username", "data": "message" }
     try {
         auto json_content = json::parse(content);
         const auto username = json_content["user"].get<std::string>();
-        const auto send_user = users.find_username(username);
         const auto data = json_content["data"].get<std::string>();
         const auto type_string = json_content["type"].get<std::string>();
         message_type type = type_string_to_enum(type_string);
 
         message msg;
-        if (send_user) {
-            msg.send_user = send_user;
-        }
+        msg.send_user = connect_user ? connect_user : nullptr;
         msg.username = username;
         msg.data = std::move(data);
         msg.type = type;
@@ -180,7 +178,7 @@ std::optional<message> json_to_message(const std::string &content, user_list &us
     }
 }
 
-std::optional<message> lisp_list_to_message(const std::string &content, user_list &users) noexcept {
+std::optional<message> lisp_list_to_message(const std::string &content, user *connect_user) noexcept {
     // (message (user 'username) (data "message"))
     // TODO: use a better way instead of regex to parse the lisp list
     try {
@@ -194,7 +192,6 @@ std::optional<message> lisp_list_to_message(const std::string &content, user_lis
         }
         std::string username = match_result[0];
         username = username.substr(7);
-        const auto send_user = users.find_username(username);
 
         if (!std::regex_search(content, match_result, data_regex)) {
             return std::nullopt;
@@ -210,9 +207,7 @@ std::optional<message> lisp_list_to_message(const std::string &content, user_lis
         message_type type = type_string_to_enum(type_string);
 
         message msg;
-        if (send_user) {
-            msg.send_user = send_user;
-        }
+        msg.send_user = connect_user ? connect_user : nullptr;
         msg.username = username;
         msg.data = std::move(data);
         msg.type = type;
@@ -230,103 +225,144 @@ void err_handler(const char *name, int i) {
     }
 }
 
-int init_socket() {
-    struct sockaddr_in addr;
-	int i, enable = 1;
+struct socket_connection {
+    user_list &users;
+    message_list &messages;
+    connection_list &connections;
+    int fd;
+    socket_connection(user_list &users_, message_list &messages_, connection_list &connections_) : users(users_), messages(messages_), connections(connections_) {
+        struct sockaddr_in addr;
+        int i, enable = 1;
 
-	err_handler("socket()", (fd = socket(AF_INET, SOCK_STREAM, 0)));
+        err_handler("socket()", (fd = socket(AF_INET, SOCK_STREAM, 0)));
+        ::fd = fd;
 
-	std::memset(&addr, 0, sizeof(struct sockaddr_in));
+        std::memset(&addr, 0, sizeof(struct sockaddr_in));
 
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port = htons(vcc_port);
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons(vcc_port);
 
-	err_handler("setsockopt()", setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)));
+        err_handler("setsockopt()", setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)));
 
 #ifdef SO_REUSEPORT
-    err_handler("setsockopt()", setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(int)));
+        err_handler("setsockopt()", setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(int)));
 #endif
-    err_handler("bind()", bind(fd, (struct sockaddr *) &addr, sizeof(struct sockaddr_in)));
-    err_handler("listen()", listen(fd, SOMAXCONN));
+        err_handler("bind()", bind(fd, (struct sockaddr *) &addr, sizeof(struct sockaddr_in)));
+        err_handler("listen()", listen(fd, SOMAXCONN));
 
-	if (!(fds = new pollfd[pollfds])) {
-		return 1;
-	}
-
-	std::memset(fds, 0, sizeof(struct pollfd) * pollfds);
-
-	for (i = 0; i < pollfds; i++) 
-		fds[i].fd = -1;
-
-	fds[0].fd = fd;
-	fds[0].events = POLLIN;
-
-	next_fd = 1;
-
-	return fd;
-}
-
-int broadcast_message(int except_fd, const message &msg, connection_list &connections) {
-    auto data_sent = msg.to_lisp_list(); // or msg.to_json()
-    data_sent += "\n";
-    for (auto &&i : connections.connections) {
-        int fd = i.fd;
-        if (fd == except_fd) continue;
-        if (!i.connect_user) continue;
-        write(fd, data_sent.data(), data_sent.size());
-    }
-    return 0;
-}
-
-int handle_request(connection &curr_connection, user_list &users, message_list &messages, connection_list &connections) {
-    // err if return value is 1
-    auto buf = std::make_unique<char[]>(buf_size);
-    auto fd = curr_connection.fd;
-    std::memset(buf.get(), 0, buf_size);
-    int size = read(fd, buf.get(), buf_size);
-    if (size < 0) {
-        connections.connections.erase(
-            std::remove(connections.connections.begin(), connections.connections.end(), curr_connection), connections.connections.end()
-        );
-        
-        for (int i = 1; i < nfds_total; i++) {
-            if (fds[i].fd == fd) {
-                fds[i].fd = -1;
-                break;
-            }
+        if (!(fds = new pollfd[pollfds])) {
+            return;
         }
-        return 1;
-    }
-    if (size == 0) {
-        fd = -1;
-        return 0;
-    }
 
-    std::string line{buf.get(), static_cast<size_t>(size - 1)};
-    line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+        std::memset(fds, 0, sizeof(struct pollfd) * pollfds);
 
-    if (line == "end") return 1;
-    if (line.empty())  return 1;
+        for (i = 0; i < pollfds; i++) 
+            fds[i].fd = -1;
 
-    std::optional<message> new_message_optional;
-    if (line[0] == '(') {
-        new_message_optional = lisp_list_to_message(line, users);
-        std::cout << "LISP ";
-    } else {
-        new_message_optional = json_to_message(line, users);
-        std::cout << "JSON ";
+        fds[0].fd = fd;
+        fds[0].events = POLLIN;
+
+        next_fd = 1;
+        
     }
+    void broadcast_message(connection &except_connection, const message &msg) {
+        auto data_sent = msg.to_lisp_list(); // or msg.to_json()
+        data_sent += "\n";
+        for (auto &&i : connections.connections) {
+            if (i == except_connection) continue;
+            if (!i.connect_user) continue;
+            write(i.fd, data_sent.data(), data_sent.size());
+        }
+    }
+    void poll_loop(std::function<void(int)> func) {
+        for (;;) {
+            int n = poll(fds, nfds_total, -1);
+
+            if (n == -1) {
+                return;
+            }
+            if (fds[0].revents & POLLIN) {
+                socklen_t size = sizeof(struct sockaddr_in);
+                struct sockaddr usr_addr;
+                int usr_fd;
+
+                err_handler("accept()", (usr_fd = accept(fd, (struct sockaddr *) &usr_addr, &size)));
+                fds[next_fd].fd = usr_fd;
+                fds[next_fd].events = POLLIN;
+
+                connections.connections.push_back(connection {
+                    .fd = usr_fd,
+                    .connect_user = nullptr
+                });
+                std::cout << "fd: " << usr_fd << std::endl;
+
+                next_fd++;
+                nfds_total++;
+            }
+            for (int i = 1; i < nfds_total; i++) {
+                if (fds[i].fd == -1) 
+                    continue;
+
+                if (fds[i].revents & POLLIN) {
+                    func(fds[i].fd);
+                }
+                fds[i].revents = 0;
+            }
+
+        }
+    }
+    std::optional<message> recv(connection &curr_connection) {
+        auto buf = std::make_unique<char[]>(buf_size);
+        int fd = curr_connection.fd;
+        std::memset(buf.get(), 0, buf_size);
+        int size = read(fd, buf.get(), buf_size);
+        
+        if (size < 0 || size == 0) {
+            connections.connections.erase(
+                std::remove(connections.connections.begin(), connections.connections.end(), curr_connection), connections.connections.end()
+            );
+            
+            for (int i = 1; i < nfds_total; i++) {
+                if (fds[i].fd == fd) {
+                    fds[i].fd = -1;
+                    break;
+                }
+            }
+            return std::nullopt;
+        }
+
+        std::string line{buf.get(), static_cast<size_t>(size - 1)};
+        line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+
+        if (line.empty())  return std::nullopt;
+
+        std::optional<message> new_message_optional;
+        if (line[0] == '(') {
+            new_message_optional = lisp_list_to_message(line, curr_connection.connect_user);
+            std::cout << "LISP\n";
+        } else {
+            new_message_optional = json_to_message(line, curr_connection.connect_user);
+            std::cout << "JSON\n";
+        }
+        return new_message_optional;
+    }
+};
+
+int handle_request(connection &curr_connection, user_list &users, message_list &messages, socket_connection &sock) {
+    // err if return value is 1
+    auto new_message_optional = sock.recv(curr_connection);
     if (!new_message_optional.has_value()) {
         std::cerr << "error\n" << std::endl;
         return 1;
     }
     const auto new_message = new_message_optional.value();
-    std::cout << new_message.send_user->username << " " << new_message.data << std::endl;
+
+    std::cout << type_enum_to_string(new_message.type) << " " << (new_message.send_user ? new_message.send_user->username : new_message.username) << " " << new_message.data << std::endl;
     switch (new_message.type) {
         case message_type::NORMAL:
             if (!curr_connection.connect_user) break;
-            broadcast_message(fd, new_message, connections);
+            sock.broadcast_message(curr_connection, new_message);
             messages.messages.emplace_back(std::move(new_message));
             break;
         case message_type::LOGIN: {
@@ -337,6 +373,7 @@ int handle_request(connection &curr_connection, user_list &users, message_list &
             if (login_user->password == new_message.data) {
                 curr_connection.connect_user = login_user;
             }
+            break;
         }
         case message_type::INVALID:
             break;
@@ -349,44 +386,11 @@ int main() {
     user_list users;
     message_list messages;
     connection_list connections;
-
-    init_socket();
-
-    for (;;) {
-        int n = poll(fds, nfds_total, -1);
-
-        if (n == -1) {
-            break;
-        }
-        if (fds[0].revents & POLLIN) {
-			socklen_t size = sizeof(struct sockaddr_in);
-            struct sockaddr usr_addr;
-            int usr_fd;
-
-			err_handler("accept()", (usr_fd = accept(fd, (struct sockaddr *) &usr_addr, &size)));
-			fds[next_fd].fd = usr_fd;
-			fds[next_fd].events = POLLIN;
-
-            connections.connections.push_back(connection {
-                .fd = usr_fd,
-                .connect_user = nullptr
-            });
-            std::cout << "fd: " << usr_fd << std::endl;
-
-			next_fd++;
-			nfds_total++;
-		}
-        for (int i = 1; i < nfds_total; i++) {
-			if (fds[i].fd == -1) 
-				continue;
-
-			if (fds[i].revents & POLLIN) {
-                const auto curr_connection = connections.find_fd(fds[i].fd);
-                if (handle_request(*curr_connection, users, messages, connections)) break;
-			}
-			fds[i].revents = 0;
-		}
-    }
+    socket_connection sock{users, messages, connections};
+    sock.poll_loop([&] (int fd) {
+        const auto curr_connection = connections.find_fd(fd);
+        handle_request(*curr_connection, users, messages, sock);
+    });
     for (auto &&i : messages.messages) {
         std::cout << i.send_user->username << " " << i.data << "\n";
     }
